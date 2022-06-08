@@ -1,8 +1,10 @@
 use reqwest;
+use scraper::{Html, Selector};
 use std::borrow::BorrowMut;
 use std::error::Error;
+use urlparse::Url;
 
-use tokio::sync::mpsc::Receiver;
+use tokio::sync::mpsc::{Receiver, Sender};
 
 use tokio::{
     self, select,
@@ -11,20 +13,41 @@ use tokio::{
 
 use stable_eyre::eyre::{eyre, Report, Result};
 
-async fn crawl(url: String) -> Result<Vec<String>, Report> {
-    let body = reqwest::get(url).await.expect("failed to fetch url");
+
+async fn crawl(url: (i32, String), work_tx: Sender<String>) -> Result<Vec<String>, Report> {
+    let mut urls = Vec::new();
+    {
+        let body = reqwest::get(url).await?;
+        let text = body.text().await.expect("Failed to get text of body");
+        let ast = Html::parse_document(&text);
+        let selector = Selector::parse("a").unwrap();
+        for elem in ast.select(&selector) {
+            if let Some(url) = elem.value().attr("href") {
+                let url = Url::parse(url);
+                let full_path = format!("{}://{}{}", url.scheme, url.netloc, url.path);
+                urls.push(full_path);
+            }
+        }
+    }
+    for url in urls {
+        work_tx.send(url).await;
+    }
     // Function: response.text => Vec<URL>
     // +1 on the number of tasks we've ran
     // how do you handle errors without await-ing
     Err(eyre!("this failed"))
 }
 
-async fn crawler_dispatch(mut work_rx: Receiver<String>, mut quit: oneshot::Receiver<()>) {
+async fn crawler_dispatch(
+    mut work_rx: Receiver<String>,
+    work_tx: Sender<String>,
+    mut quit: oneshot::Receiver<()>,
+) {
     loop {
         select! {
             Some(url) = work_rx.recv() => {
                 println!("doing some work on {url}");
-                tokio::spawn(crawl(url));
+                tokio::spawn(crawl(url, work_tx.clone()));
             },
 
             // why does this work since poll(mut self)
@@ -51,7 +74,7 @@ async fn main() {
 
     let (quit_tx, quit_rx) = oneshot::channel::<()>();
 
-    let dispatch_handler = tokio::spawn(crawler_dispatch(work_rx, quit_rx));
+    let dispatch_handler = tokio::spawn(crawler_dispatch(work_rx, work_tx.clone(), quit_rx));
     let sending = work_tx.send(target.to_string());
     tokio::join!(dispatch_handler, sending);
 }
